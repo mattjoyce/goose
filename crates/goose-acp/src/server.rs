@@ -24,10 +24,11 @@ use sacp::schema::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, AuthenticateResponse, BlobResourceContents,
     CancelNotification, Content, ContentBlock, ContentChunk, EmbeddedResource,
     EmbeddedResourceResource, ImageContent, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, ModelId, ModelInfo,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, ResourceLink, SessionId, SessionModelState, SessionNotification,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
+    ModelId, ModelInfo, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionModelState, SessionNotification,
     SessionUpdate, SetSessionModelRequest, SetSessionModelResponse, StopReason, TextContent,
     TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -102,6 +103,10 @@ fn create_tool_location(path: &str, line: Option<u32>) -> ToolCallLocation {
     loc
 }
 
+fn is_developer_file_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "write" | "edit")
+}
+
 fn extract_tool_locations(
     tool_request: &goose::conversation::message::ToolRequest,
     tool_response: &goose::conversation::message::ToolResponse,
@@ -109,10 +114,11 @@ fn extract_tool_locations(
     let mut locations = Vec::new();
 
     if let Ok(tool_call) = &tool_request.tool_call {
-        if tool_call.name != "developer__text_editor" {
+        if !is_developer_file_tool(tool_call.name.as_ref()) {
             return locations;
         }
 
+        let tool_name = tool_call.name.as_ref();
         let path_str = tool_call
             .arguments
             .as_ref()
@@ -120,6 +126,11 @@ fn extract_tool_locations(
             .and_then(|p| p.as_str());
 
         if let Some(path_str) = path_str {
+            if matches!(tool_name, "write" | "edit") {
+                locations.push(create_tool_location(path_str, Some(1)));
+                return locations;
+            }
+
             let command = tool_call
                 .arguments
                 .as_ref()
@@ -276,20 +287,21 @@ async fn add_extensions(agent: &Agent, extensions: Vec<ExtensionConfig>) {
     }
 }
 
-async fn build_model_state(
-    provider: &dyn Provider,
-    current_model: &str,
-) -> Result<SessionModelState, sacp::Error> {
-    let models = provider.fetch_recommended_models().await.map_err(|e| {
-        sacp::Error::internal_error().data(format!("Failed to fetch models: {}", e))
-    })?;
-    Ok(SessionModelState::new(
+async fn build_model_state(provider: &dyn Provider, current_model: &str) -> SessionModelState {
+    let models = match provider.fetch_recommended_models().await {
+        Ok(models) => models,
+        Err(e) => {
+            warn!(error = %e, "failed to fetch models, model selection will be unavailable");
+            vec![]
+        }
+    };
+    SessionModelState::new(
         ModelId::new(current_model),
         models
             .iter()
             .map(|name| ModelInfo::new(ModelId::new(&**name), &**name))
             .collect(),
-    ))
+    )
 }
 
 impl GooseAcpAgent {
@@ -653,6 +665,7 @@ impl GooseAcpAgent {
 
         let capabilities = AgentCapabilities::new()
             .load_session(true)
+            .session_capabilities(SessionCapabilities::new().list(SessionListCapabilities::new()))
             .prompt_capabilities(
                 PromptCapabilities::new()
                     .image(true)
@@ -728,7 +741,7 @@ impl GooseAcpAgent {
         );
 
         let model_state =
-            build_model_state(&*provider, &provider.get_model_config().model_name).await?;
+            build_model_state(&*provider, &provider.get_model_config().model_name).await;
 
         Ok(NewSessionResponse::new(SessionId::new(goose_session.id)).models(model_state))
     }
@@ -853,7 +866,7 @@ impl GooseAcpAgent {
         );
 
         let model_state =
-            build_model_state(&*provider, &provider.get_model_config().model_name).await?;
+            build_model_state(&*provider, &provider.get_model_config().model_name).await;
 
         Ok(LoadSessionResponse::new().models(model_state))
     }
@@ -1086,14 +1099,15 @@ impl GooseAcpAgent {
             .list_sessions()
             .await
             .map_err(|e| sacp::Error::internal_error().data(e.to_string()))?;
-        let sessions_json = sessions
+        let session_infos: Vec<SessionInfo> = sessions
             .into_iter()
-            .map(|s| serde_json::to_value(&s))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| sacp::Error::internal_error().data(e.to_string()))?;
-        Ok(ListSessionsResponse {
-            sessions: sessions_json,
-        })
+            .map(|s| {
+                SessionInfo::new(SessionId::new(s.id), s.working_dir)
+                    .title(s.name)
+                    .updated_at(s.updated_at.to_rfc3339())
+            })
+            .collect();
+        Ok(ListSessionsResponse::new(session_infos))
     }
 
     #[custom_method("session/get")]
@@ -1193,112 +1207,133 @@ impl JrMessageHandler for GooseAcpHandler {
         "goose-acp"
     }
 
-    async fn handle_message(
+    fn handle_message(
         &mut self,
         message: MessageCx,
         cx: JrConnectionCx<AgentToClient>,
-    ) -> Result<Handled<MessageCx>, sacp::Error> {
+    ) -> impl std::future::Future<Output = Result<Handled<MessageCx>, sacp::Error>> + Send {
         use sacp::util::MatchMessageFrom;
         use sacp::JrRequestCx;
 
-        MatchMessageFrom::new(message, &cx)
-            .if_request(
-                |req: InitializeRequest, req_cx: JrRequestCx<InitializeResponse>| async {
-                    req_cx.respond(self.agent.on_initialize(req).await?)
-                },
-            )
-            .await
-            .if_request(
-                |_req: AuthenticateRequest, req_cx: JrRequestCx<AuthenticateResponse>| async {
-                    req_cx.respond(AuthenticateResponse::new())
-                },
-            )
-            .await
-            .if_request(
-                |req: NewSessionRequest, req_cx: JrRequestCx<NewSessionResponse>| async {
-                    req_cx.respond(self.agent.on_new_session(req).await?)
-                },
-            )
-            .await
-            .if_request(
-                |req: LoadSessionRequest, req_cx: JrRequestCx<LoadSessionResponse>| async {
-                    req_cx.respond(self.agent.on_load_session(req, &cx).await?)
-                },
-            )
-            .await
-            .if_request(
-                |req: PromptRequest, req_cx: JrRequestCx<PromptResponse>| async {
-                    let agent = self.agent.clone();
-                    let cx_clone = cx.clone();
-                    cx.spawn(async move {
-                        match agent.on_prompt(req, &cx_clone).await {
-                            Ok(response) => {
-                                req_cx.respond(response)?;
+        let agent = self.agent.clone();
+
+        // The MatchMessageFrom chain produces an ~85KB async state machine.
+        // Box::pin moves it to the heap so it doesn't overflow the tokio worker stack.
+        Box::pin(async move {
+            MatchMessageFrom::new(message, &cx)
+                .if_request(
+                    |req: InitializeRequest, req_cx: JrRequestCx<InitializeResponse>| async {
+                        req_cx.respond(agent.on_initialize(req).await?)
+                    },
+                )
+                .await
+                .if_request(
+                    |_req: AuthenticateRequest, req_cx: JrRequestCx<AuthenticateResponse>| async {
+                        req_cx.respond(AuthenticateResponse::new())
+                    },
+                )
+                .await
+                .if_request(
+                    |req: NewSessionRequest, req_cx: JrRequestCx<NewSessionResponse>| async {
+                        req_cx.respond(agent.on_new_session(req).await?)
+                    },
+                )
+                .await
+                .if_request(
+                    |req: LoadSessionRequest, req_cx: JrRequestCx<LoadSessionResponse>| async {
+                        req_cx.respond(agent.on_load_session(req, &cx).await?)
+                    },
+                )
+                .await
+                .if_request(
+                    |req: PromptRequest, req_cx: JrRequestCx<PromptResponse>| async {
+                        let agent = agent.clone();
+                        let cx_clone = cx.clone();
+                        cx.spawn(async move {
+                            match agent.on_prompt(req, &cx_clone).await {
+                                Ok(response) => {
+                                    req_cx.respond(response)?;
+                                }
+                                Err(e) => {
+                                    req_cx.respond_with_error(e)?;
+                                }
                             }
-                            Err(e) => {
-                                req_cx.respond_with_error(e)?;
-                            }
-                        }
+                            Ok(())
+                        })?;
                         Ok(())
-                    })?;
-                    Ok(())
-                },
-            )
-            .await
-            .if_notification(|notif: CancelNotification| async {
-                self.agent.on_cancel(notif).await
-            })
-            .await
-            // Handle methods not yet in the sacp typed API.
-            // - session/set_model: typed support pending in sacp
-            // - _<method>: custom requests that will eventually route to goose-server
-            .otherwise({
-                let agent = self.agent.clone();
-                |message: MessageCx| async move {
-                    match message {
-                        MessageCx::Request(req, request_cx)
-                            if req.method == "session/set_model" =>
-                        {
-                            let params: SetSessionModelRequest = serde_json::from_value(req.params)
-                                .map_err(|e| sacp::Error::invalid_params().data(e.to_string()))?;
-                            let resp = agent
-                                .on_set_model(&params.session_id.0, &params.model_id.0)
-                                .await?;
-                            let json = serde_json::to_value(resp)
-                                .map_err(|e| sacp::Error::internal_error().data(e.to_string()))?;
-                            request_cx.respond(json)?;
-                            Ok(())
-                        }
-                        MessageCx::Request(req, request_cx) if req.method.starts_with('_') => {
-                            match agent.handle_custom_request(&req.method, req.params).await {
-                                Ok(json) => request_cx.respond(json)?,
-                                Err(e) => request_cx.respond_with_error(e)?,
+                    },
+                )
+                .await
+                .if_notification(|notif: CancelNotification| async { agent.on_cancel(notif).await })
+                .await
+                // Handle methods not yet in the sacp typed API.
+                // - session/set_model: typed support pending in sacp
+                // - _<method>: custom requests that will eventually route to goose-server
+                .otherwise({
+                    let agent = agent.clone();
+                    |message: MessageCx| async move {
+                        match message {
+                            MessageCx::Request(req, request_cx)
+                                if req.method == "session/set_model" =>
+                            {
+                                let params: SetSessionModelRequest =
+                                    serde_json::from_value(req.params).map_err(|e| {
+                                        sacp::Error::invalid_params().data(e.to_string())
+                                    })?;
+                                let resp = agent
+                                    .on_set_model(&params.session_id.0, &params.model_id.0)
+                                    .await?;
+                                let json = serde_json::to_value(resp).map_err(|e| {
+                                    sacp::Error::internal_error().data(e.to_string())
+                                })?;
+                                request_cx.respond(json)?;
+                                Ok(())
                             }
-                            Ok(())
+                            MessageCx::Request(req, request_cx) if req.method == "session/list" => {
+                                let resp = agent.on_list_sessions().await?;
+                                let json = serde_json::to_value(resp).map_err(|e| {
+                                    sacp::Error::internal_error().data(e.to_string())
+                                })?;
+                                request_cx.respond(json)?;
+                                Ok(())
+                            }
+                            MessageCx::Request(req, request_cx) if req.method.starts_with('_') => {
+                                match agent.handle_custom_request(&req.method, req.params).await {
+                                    Ok(json) => request_cx.respond(json)?,
+                                    Err(e) => request_cx.respond_with_error(e)?,
+                                }
+                                Ok(())
+                            }
+                            _ => Err(sacp::Error::method_not_found()),
                         }
-                        _ => Err(sacp::Error::method_not_found()),
                     }
-                }
-            })
-            .await
-            .map(|()| Handled::Yes)
+                })
+                .await
+                .map(|()| Handled::Yes)
+        })
     }
 }
 
-pub async fn serve<R, W>(agent: Arc<GooseAcpAgent>, read: R, write: W) -> Result<()>
+pub fn serve<R, W>(
+    agent: Arc<GooseAcpAgent>,
+    read: R,
+    write: W,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
 where
     R: futures::AsyncRead + Unpin + Send + 'static,
     W: futures::AsyncWrite + Unpin + Send + 'static,
 {
-    let handler = GooseAcpHandler { agent };
+    Box::pin(async move {
+        let handler = GooseAcpHandler { agent };
 
-    AgentToClient::builder()
-        .name("goose-acp")
-        .with_handler(handler)
-        .serve(ByteStreams::new(write, read))
-        .await?;
+        AgentToClient::builder()
+            .name("goose-acp")
+            .with_handler(handler)
+            .serve(ByteStreams::new(write, read))
+            .await?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
 pub async fn run(builtins: Vec<String>) -> Result<()> {
@@ -1419,10 +1454,7 @@ print(\"hello, world\")
 
     #[test]
     fn test_format_tool_name_with_extension() {
-        assert_eq!(
-            format_tool_name("developer__text_editor"),
-            "Developer: Text Editor"
-        );
+        assert_eq!(format_tool_name("developer__edit"), "Developer: Edit");
         assert_eq!(
             format_tool_name("platform__manage_extensions"),
             "Platform: Manage Extensions"
@@ -1508,37 +1540,37 @@ print(\"hello, world\")
 
     #[test_case(
         "model-a", Ok(vec!["model-a".into(), "model-b".into()])
-        => Ok(SessionModelState::new(
+        => SessionModelState::new(
             ModelId::new("model-a"),
             vec![ModelInfo::new(ModelId::new("model-a"), "model-a"),
                  ModelInfo::new(ModelId::new("model-b"), "model-b")],
-        ))
+        )
         ; "returns current and available models"
     )]
     #[test_case(
         "model-a", Ok(vec![])
-        => Ok(SessionModelState::new(ModelId::new("model-a"), vec![]))
+        => SessionModelState::new(ModelId::new("model-a"), vec![])
         ; "empty model list"
     )]
     #[test_case(
         "model-a", Err(ProviderError::ExecutionError("fail".into()))
-        => matches Err(_)
-        ; "fetch error propagates"
+        => SessionModelState::new(ModelId::new("model-a"), vec![])
+        ; "fetch error falls back to current model only"
     )]
     #[test_case(
         "switched-model", Ok(vec!["model-a".into(), "switched-model".into()])
-        => Ok(SessionModelState::new(
+        => SessionModelState::new(
             ModelId::new("switched-model"),
             vec![ModelInfo::new(ModelId::new("model-a"), "model-a"),
                  ModelInfo::new(ModelId::new("switched-model"), "switched-model")],
-        ))
+        )
         ; "current model reflects switched model"
     )]
     #[tokio::test]
     async fn test_build_model_state(
         current_model: &str,
         models: Result<Vec<String>, ProviderError>,
-    ) -> Result<SessionModelState, sacp::Error> {
+    ) -> SessionModelState {
         let provider = MockModelProvider { models };
         build_model_state(&provider, current_model).await
     }
